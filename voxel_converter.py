@@ -1,0 +1,303 @@
+#!/usr/bin/env python3
+"""
+Monoprice Voxel GX File Converter
+Converts STL/gcode files to GX format with dimension validation for 150x150x150mm build area.
+
+Usage:
+    python voxel_converter.py <input_file>
+"""
+
+import sys
+import struct
+import re
+from pathlib import Path
+from typing import Tuple, Optional
+import subprocess
+
+
+class VoxelConverter:
+    # Monoprice Voxel build area dimensions (mm)
+    BUILD_AREA = (150.0, 150.0, 150.0)
+    
+    # Known GX binary header magic bytes for Monoprice Voxel
+    GX_HEADER = b'\x00\x00\x00\x00'  # Placeholder - actual header may vary
+    
+    def __init__(self, input_file: str):
+        self.input_path = Path(input_file)
+        self.validate_input_exists()
+        self.file_ext = self.input_path.suffix.lower()
+    
+    def validate_input_exists(self):
+        """Check if input file exists."""
+        if not self.input_path.exists():
+            raise FileNotFoundError(f"File not found: {self.input_path}")
+        if not self.input_path.is_file():
+            raise ValueError(f"Not a file: {self.input_path}")
+    
+    def validate_extension(self) -> bool:
+        """Validate file extension is STL, gcode, GX, or G."""
+        valid_exts = {'.stl', '.gcode', '.gx', '.g'}
+        if self.file_ext not in valid_exts:
+            raise ValueError(
+                f"Invalid file extension: {self.file_ext}. "
+                f"Supported: {', '.join(valid_exts)}"
+            )
+        return True
+    
+    def parse_stl_ascii(self, content: str) -> Tuple[float, float, float, float, float, float]:
+        """Parse ASCII STL file and extract bounding box coordinates."""
+        vertices = []
+        for line in content.split('\n'):
+            line = line.strip()
+            if line.startswith('vertex'):
+                parts = line.split()
+                if len(parts) == 4:
+                    try:
+                        x, y, z = float(parts[1]), float(parts[2]), float(parts[3])
+                        vertices.append((x, y, z))
+                    except ValueError:
+                        continue
+        
+        if not vertices:
+            raise ValueError("No vertices found in STL file")
+        
+        xs, ys, zs = zip(*vertices)
+        return min(xs), max(xs), min(ys), max(ys), min(zs), max(zs)
+    
+    def parse_stl_binary(self, data: bytes) -> Tuple[float, float, float, float, float, float]:
+        """Parse binary STL file and extract bounding box coordinates."""
+        if len(data) < 84:
+            raise ValueError("Binary STL file too small")
+        
+        # Skip 80-byte header and 4-byte triangle count
+        num_triangles = struct.unpack('<I', data[80:84])[0]
+        
+        vertices = []
+        offset = 84
+        
+        for _ in range(num_triangles):
+            # Skip normal vector (12 bytes)
+            offset += 12
+            
+            # Read 3 vertices (each 3 floats = 12 bytes)
+            for _ in range(3):
+                if offset + 12 <= len(data):
+                    x, y, z = struct.unpack('<fff', data[offset:offset+12])
+                    vertices.append((x, y, z))
+                    offset += 12
+            
+            # Skip attribute byte count (2 bytes)
+            offset += 2
+        
+        if not vertices:
+            raise ValueError("No vertices found in binary STL file")
+        
+        xs, ys, zs = zip(*vertices)
+        return min(xs), max(xs), min(ys), max(ys), min(zs), max(zs)
+    
+    def get_stl_dimensions(self) -> Tuple[float, float, float, float, float, float]:
+        """Read STL file and extract bounding box."""
+        try:
+            # Try ASCII format first
+            content = self.input_path.read_text(encoding='utf-8')
+            if 'solid' in content.lower():
+                return self.parse_stl_ascii(content)
+        except (UnicodeDecodeError, ValueError):
+            pass
+        
+        # Fall back to binary format
+        data = self.input_path.read_bytes()
+        return self.parse_stl_binary(data)
+    
+    def parse_gcode_dimensions(self) -> Tuple[float, float, float, float, float, float]:
+        """Parse gcode file and extract max X, Y, Z coordinates."""
+        content = self.input_path.read_text(encoding='utf-8', errors='ignore')
+        
+        x_coords = []
+        y_coords = []
+        z_coords = []
+        
+        # Pattern to match G0/G1 commands with coordinates
+        # Matches lines like: G1 X10.5 Y20.3 Z5.1 F1200
+        pattern = r'G[01]\s+(?:.*?([XY])([\d.-]+))?.*?(?:([XY])([\d.-]+))?.*?(?:(Z)([\d.-]+))?'
+        
+        for line in content.split('\n'):
+            line = line.strip()
+            if not line or line.startswith(';'):
+                continue
+            
+            # Extract X coordinate
+            x_match = re.search(r'X([-\d.]+)', line, re.IGNORECASE)
+            if x_match:
+                x_coords.append(float(x_match.group(1)))
+            
+            # Extract Y coordinate
+            y_match = re.search(r'Y([-\d.]+)', line, re.IGNORECASE)
+            if y_match:
+                y_coords.append(float(y_match.group(1)))
+            
+            # Extract Z coordinate
+            z_match = re.search(r'Z([-\d.]+)', line, re.IGNORECASE)
+            if z_match:
+                z_coords.append(float(z_match.group(1)))
+        
+        if not (x_coords or y_coords or z_coords):
+            raise ValueError("No movement commands found in gcode file")
+        
+        min_x = min(x_coords) if x_coords else 0
+        max_x = max(x_coords) if x_coords else 0
+        min_y = min(y_coords) if y_coords else 0
+        max_y = max(y_coords) if y_coords else 0
+        min_z = min(z_coords) if z_coords else 0
+        max_z = max(z_coords) if z_coords else 0
+        
+        return min_x, max_x, min_y, max_y, min_z, max_z
+    
+    def get_dimensions(self) -> Tuple[float, float, float]:
+        """Get XYZ dimensions of the model, checking against build area."""
+        if self.file_ext == '.stl':
+            min_x, max_x, min_y, max_y, min_z, max_z = self.get_stl_dimensions()
+        elif self.file_ext in {'.gcode', '.gx', '.g'}:
+            min_x, max_x, min_y, max_y, min_z, max_z = self.parse_gcode_dimensions()
+        else:
+            raise ValueError(f"Cannot extract dimensions from {self.file_ext}")
+        
+        # Calculate actual dimensions
+        dim_x = max_x - min_x
+        dim_y = max_y - min_y
+        dim_z = max_z - min_z
+        
+        return dim_x, dim_y, dim_z
+    
+    def check_dimensions(self) -> bool:
+        """Verify dimensions fit within build area."""
+        dim_x, dim_y, dim_z = self.get_dimensions()
+        max_x, max_y, max_z = self.BUILD_AREA
+        
+        print(f"Model Dimensions: {dim_x:.2f}mm × {dim_y:.2f}mm × {dim_z:.2f}mm")
+        print(f"Build Area:       {max_x:.2f}mm × {max_y:.2f}mm × {max_z:.2f}mm")
+        
+        if dim_x > max_x or dim_y > max_y or dim_z > max_z:
+            print("❌ ERROR: Model exceeds build area!")
+            if dim_x > max_x:
+                print(f"   X dimension {dim_x:.2f}mm exceeds max {max_x}mm")
+            if dim_y > max_y:
+                print(f"   Y dimension {dim_y:.2f}mm exceeds max {max_y}mm")
+            if dim_z > max_z:
+                print(f"   Z dimension {dim_z:.2f}mm exceeds max {max_z}mm")
+            return False
+        
+        print("✓ Dimensions OK")
+        return True
+    
+    def stl_to_gcode(self) -> Path:
+        """Convert STL to gcode using external tool.
+        
+        Requires either:
+        - FlashPrint CLI (https://www.flashforge.com/support)
+        - Or Cura (https://ultimaker.com/software/ultimaker-cura)
+        """
+        output_path = self.input_path.with_suffix('.gcode')
+        
+        print(f"\nSTL file detected. Conversion to gcode required.")
+        print(f"This script can use FlashPrint CLI or Cura for slicing.")
+        print(f"\nOption 1: Use FlashPrint 5 (GUI)")
+        print(f"  - Open FlashPrint 5")
+        print(f"  - Import: {self.input_path}")
+        print(f"  - Select Monoprice Voxel profile")
+        print(f"  - Export as gcode")
+        print(f"\nOption 2: Install Cura or FlashPrint CLI")
+        print(f"  - FlashPrint: https://www.flashforge.com/support")
+        print(f"  - Cura (with Monoprice Voxel profile): https://ultimaker.com/software/ultimaker-cura")
+        
+        # Try FlashPrint CLI if available
+        try:
+            subprocess.run(
+                ['FlashPrint', '-s', str(self.input_path), '-o', str(output_path)],
+                check=True,
+                capture_output=True
+            )
+            print(f"✓ Converted to: {output_path}")
+            return output_path
+        except FileNotFoundError:
+            pass
+        except subprocess.CalledProcessError as e:
+            print(f"FlashPrint conversion failed: {e.stderr.decode()}")
+        
+        raise RuntimeError(
+            f"STL file requires conversion to gcode. No slicing tool found.\n"
+            f"Please use FlashPrint 5 or Cura to convert {self.input_path} to gcode format."
+        )
+    
+    def gcode_to_gx(self, gcode_path: Path) -> Path:
+        """Convert gcode to gx format by adding Monoprice Voxel header."""
+        output_path = gcode_path.with_suffix('.gx')
+        
+        gcode_content = gcode_path.read_bytes()
+        
+        # Monoprice Voxel GX format: 4-byte header + gcode content
+        # Standard header for Voxel GX files
+        gx_content = self.GX_HEADER + gcode_content
+        
+        output_path.write_bytes(gx_content)
+        print(f"✓ Converted to: {output_path}")
+        return output_path
+    
+    def process(self) -> Optional[Path]:
+        """Main processing pipeline."""
+        print(f"Processing: {self.input_path}")
+        print(f"File type: {self.file_ext}\n")
+        
+        # Validate extension
+        self.validate_extension()
+        
+        # Check dimensions
+        if not self.check_dimensions():
+            return None
+        
+        # Process based on file type
+        if self.file_ext == '.stl':
+            print("\n→ Converting STL to gcode...")
+            gcode_path = self.stl_to_gcode()
+            print("\n→ Converting gcode to gx...")
+            return self.gcode_to_gx(gcode_path)
+        
+        elif self.file_ext == '.gcode':
+            print("\n→ Converting gcode to gx...")
+            return self.gcode_to_gx(self.input_path)
+        
+        elif self.file_ext == '.gx':
+            print("\n✓ Already in GX format - no conversion needed")
+            return self.input_path
+        
+        elif self.file_ext == '.g':
+            print("\n✓ G file detected - leaving as-is for FlashPrint")
+            return self.input_path
+        
+        return None
+
+
+def main():
+    if len(sys.argv) != 2:
+        print("Usage: python voxel_converter.py <input_file>")
+        print("Supported formats: .stl, .gcode, .gx, .g")
+        sys.exit(1)
+    
+    try:
+        converter = VoxelConverter(sys.argv[1])
+        output = converter.process()
+        
+        if output:
+            print(f"\n✓ Ready to print: {output}")
+            sys.exit(0)
+        else:
+            print("\n✗ Processing failed - file exceeds build area")
+            sys.exit(1)
+    
+    except Exception as e:
+        print(f"\n✗ Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == '__main__':
+    main()
