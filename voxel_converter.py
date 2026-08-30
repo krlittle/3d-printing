@@ -1,18 +1,206 @@
 #!/usr/bin/env python3
 """
 Monoprice Voxel GX File Converter
-Converts STL/gcode files to GX format with dimension validation for 150x150x150mm build area.
+Converts STL/gcode/bgcode files to GX format with dimension validation for
+150x150x150mm build area.
 
 Usage:
     python voxel_converter.py <input_file>
+
+Supported inputs: .stl, .gcode, .bgcode (binary gcode), .gx, .g
 """
 
 import sys
 import struct
 import re
+import zlib
 from pathlib import Path
 from typing import Tuple, Optional
 import subprocess
+
+
+# ---------------------------------------------------------------------------
+# Binary G-code (bgcode) support
+#
+# bgcode is the PrusaSlicer / libbgcode container format. Layout:
+#
+#   File header:  magic 'GCDE' (4) | version u32 | checksum_type u16
+#   Then repeated blocks:
+#       type u16 | compression u16 | uncompressed_size u32
+#       [compressed_size u32]   -- only when compression != 0
+#       parameters             -- 6 bytes for thumbnails, else 2 bytes (encoding u16)
+#       data                   -- compressed_size bytes if compressed, else uncompressed
+#       [crc32 u32]            -- only when checksum_type == 1
+#
+#   Block types:   0 file-meta, 1 gcode, 2 slicer-meta, 3 printer-meta,
+#                  4 print-meta, 5 thumbnail
+#   Compression:   0 none, 1 deflate (zlib), 2/3 heatshrink
+#   GCode encoding: 0 none, 1 MeatPack, 2 MeatPack w/ comments
+# ---------------------------------------------------------------------------
+
+BGCODE_MAGIC = b'GCDE'
+
+_MP_LOOKUP = "0123456789. \nGX\x00"  # MeatPack 4-bit -> char table (index 15 = literal)
+_MP_CMD_BYTE = 0xFF
+_MP_CMD_DISABLE_NO_SPACES = 246
+_MP_CMD_ENABLE_NO_SPACES = 247
+_MP_CMD_QUERY = 248
+_MP_CMD_RESET = 249
+_MP_CMD_DISABLE_PACKING = 250
+_MP_CMD_ENABLE_PACKING = 251
+_MP_CMD_TOGGLE_PACKING = 253
+
+
+def meatpack_decode(data: bytes, packing_default: bool = False) -> bytes:
+    """Decode a MeatPack byte stream back to plain gcode text.
+
+    MeatPack squeezes the common gcode characters (digits, '.', ' ', '\\n', 'G',
+    'X') into 4-bit nibbles, two per byte. A nibble of 0b1111 means "this
+    character is not packable, read the next full byte literally". The byte
+    0xFF is the command escape: 0xFF 0xFF <cmd> toggles packing / no-spaces
+    modes, while a lone 0xFF marks a byte whose two nibbles are both literal.
+    """
+    out = bytearray()
+    packing = packing_default
+    no_spaces = False
+    ff_count = 0            # consecutive 0xFF bytes seen
+    await_cmd = False       # next byte is a command code
+    pending_literals = 0    # literal full-width bytes still expected
+    deferred_char = None    # resolved char to emit after a pending literal
+
+    def lookup(nib: int) -> str:
+        if no_spaces and nib == 11:
+            return 'E'
+        return _MP_LOOKUP[nib]
+
+    for b in data:
+        if b == _MP_CMD_BYTE:
+            ff_count += 1
+            if ff_count == 2:
+                await_cmd = True
+                ff_count = 0
+            continue
+
+        if await_cmd:
+            await_cmd = False
+            if b == _MP_CMD_ENABLE_PACKING:
+                packing = True
+            elif b == _MP_CMD_DISABLE_PACKING:
+                packing = False
+            elif b == _MP_CMD_TOGGLE_PACKING:
+                packing = not packing
+            elif b == _MP_CMD_RESET:
+                packing = False
+                no_spaces = False
+            elif b == _MP_CMD_ENABLE_NO_SPACES:
+                no_spaces = True
+            elif b == _MP_CMD_DISABLE_NO_SPACES:
+                no_spaces = False
+            # _MP_CMD_QUERY and anything unknown: ignore
+            continue
+
+        if ff_count == 1:
+            # Lone 0xFF preceded this byte: "both nibbles literal" marker;
+            # two literal bytes follow and this is the first.
+            ff_count = 0
+            out.append(b)
+            pending_literals = 1
+            continue
+
+        if pending_literals > 0:
+            out.append(b)
+            pending_literals -= 1
+            if pending_literals == 0 and deferred_char is not None:
+                out.append(ord(deferred_char))
+                deferred_char = None
+            continue
+
+        if not packing:
+            out.append(b)
+            continue
+
+        low, high = b & 0x0F, (b >> 4) & 0x0F
+        if low != 0x0F and high != 0x0F:
+            out.append(ord(lookup(low)))
+            out.append(ord(lookup(high)))
+        elif low != 0x0F:  # high nibble literal, comes next
+            out.append(ord(lookup(low)))
+            pending_literals = 1
+        elif high != 0x0F:  # low nibble literal, comes next; then known char
+            pending_literals = 1
+            deferred_char = lookup(high)
+        else:
+            pending_literals = 2  # unreachable (that byte would be 0xFF)
+
+    return bytes(out)
+
+
+def _bgcode_decompress(payload: bytes, compression: int) -> bytes:
+    """Inflate a bgcode block payload."""
+    if compression == 0:
+        return payload
+    if compression == 1:
+        return zlib.decompress(payload)
+    if compression in (2, 3):
+        raise ValueError(
+            "This bgcode uses Heatshrink compression, which this script cannot "
+            "decode. Re-export it with 'No compression' (or Deflate), or run it "
+            "through PrusaSlicer / libbgcode first."
+        )
+    raise ValueError(f"Unknown bgcode compression type: {compression}")
+
+
+def decode_bgcode_to_text(data: bytes) -> str:
+    """Extract concatenated plain-text gcode from a bgcode file's bytes."""
+    if data[:4] != BGCODE_MAGIC:
+        raise ValueError("Not a binary gcode file (missing 'GCDE' magic).")
+
+    checksum_type = struct.unpack_from('<H', data, 8)[0]
+    pos, n = 10, len(data)
+    parts = []
+
+    while pos + 8 <= n:
+        btype, compression, uncomp_size = struct.unpack_from('<HHI', data, pos)
+        pos += 8
+
+        if compression != 0:
+            comp_size = struct.unpack_from('<I', data, pos)[0]
+            pos += 4
+        else:
+            comp_size = uncomp_size
+
+        param_len = 6 if btype == 5 else 2
+        params = data[pos:pos + param_len]
+        pos += param_len
+
+        payload = data[pos:pos + comp_size]
+        pos += comp_size
+
+        if checksum_type == 1:
+            pos += 4  # skip trailing CRC32
+
+        if btype != 1:  # only GCode blocks carry movement commands
+            continue
+
+        raw = _bgcode_decompress(payload, compression)
+        encoding = struct.unpack_from('<H', params, 0)[0] if len(params) >= 2 else 0
+
+        if encoding == 0:
+            text = raw.decode('utf-8', 'ignore')
+        elif encoding in (1, 2):
+            decoded = meatpack_decode(raw)
+            if b'G1' not in decoded and b'G0' not in decoded:
+                # Stream may not have opened with an explicit "enable packing".
+                decoded = meatpack_decode(raw, packing_default=True)
+            text = decoded.decode('utf-8', 'ignore')
+        else:
+            raise ValueError(f"Unsupported bgcode gcode encoding: {encoding}")
+
+        parts.append(text)
+
+    if not parts:
+        raise ValueError("No GCode blocks found in bgcode file.")
+    return ''.join(parts)
 
 
 class VoxelConverter:
@@ -35,14 +223,24 @@ class VoxelConverter:
             raise ValueError(f"Not a file: {self.input_path}")
     
     def validate_extension(self) -> bool:
-        """Validate file extension is STL, gcode, GX, or G."""
-        valid_exts = {'.stl', '.gcode', '.gx', '.g'}
+        """Validate file extension is STL, gcode, bgcode, GX, or G."""
+        valid_exts = {'.stl', '.gcode', '.bgcode', '.gx', '.g'}
         if self.file_ext not in valid_exts:
             raise ValueError(
                 f"Invalid file extension: {self.file_ext}. "
-                f"Supported: {', '.join(valid_exts)}"
+                f"Supported: {', '.join(sorted(valid_exts))}"
             )
         return True
+
+    def is_bgcode(self) -> bool:
+        """True if the input is binary gcode (by extension or 'GCDE' magic)."""
+        if self.file_ext == '.bgcode':
+            return True
+        try:
+            with self.input_path.open('rb') as fh:
+                return fh.read(4) == BGCODE_MAGIC
+        except OSError:
+            return False
     
     def parse_stl_ascii(self, content: str) -> Tuple[float, float, float, float, float, float]:
         """Parse ASCII STL file and extract bounding box coordinates."""
@@ -109,10 +307,16 @@ class VoxelConverter:
         data = self.input_path.read_bytes()
         return self.parse_stl_binary(data)
     
+    def read_gcode_text(self) -> str:
+        """Return the gcode as plain text, decoding bgcode if needed."""
+        if self.is_bgcode():
+            return decode_bgcode_to_text(self.input_path.read_bytes())
+        return self.input_path.read_text(encoding='utf-8', errors='ignore')
+
     def parse_gcode_dimensions(self) -> Tuple[float, float, float, float, float, float]:
         """Parse gcode file and extract max X, Y, Z coordinates."""
-        content = self.input_path.read_text(encoding='utf-8', errors='ignore')
-        
+        content = self.read_gcode_text()
+
         x_coords = []
         y_coords = []
         z_coords = []
@@ -157,7 +361,7 @@ class VoxelConverter:
         """Get XYZ dimensions of the model, checking against build area."""
         if self.file_ext == '.stl':
             min_x, max_x, min_y, max_y, min_z, max_z = self.get_stl_dimensions()
-        elif self.file_ext in {'.gcode', '.gx', '.g'}:
+        elif self.file_ext in {'.gcode', '.bgcode', '.gx', '.g'}:
             min_x, max_x, min_y, max_y, min_z, max_z = self.parse_gcode_dimensions()
         else:
             raise ValueError(f"Cannot extract dimensions from {self.file_ext}")
@@ -242,7 +446,20 @@ class VoxelConverter:
         output_path.write_bytes(gx_content)
         print(f"✓ Converted to: {output_path}")
         return output_path
-    
+
+    def bgcode_to_gcode(self) -> Path:
+        """Decode binary gcode (bgcode) to a plain-text .gcode sibling file."""
+        text = decode_bgcode_to_text(self.input_path.read_bytes())
+
+        output_path = self.input_path.with_suffix('.gcode')
+        if output_path == self.input_path:
+            # Input already carries a .gcode extension but holds binary gcode.
+            output_path = self.input_path.with_name(self.input_path.stem + '.decoded.gcode')
+
+        output_path.write_text(text, encoding='utf-8')
+        print(f"✓ Decoded to: {output_path}")
+        return output_path
+
     def process(self) -> Optional[Path]:
         """Main processing pipeline."""
         print(f"Processing: {self.input_path}")
@@ -261,11 +478,17 @@ class VoxelConverter:
             gcode_path = self.stl_to_gcode()
             print("\n→ Converting gcode to gx...")
             return self.gcode_to_gx(gcode_path)
-        
+
+        elif self.file_ext == '.bgcode' or self.is_bgcode():
+            print("\n→ Decoding binary gcode (bgcode)...")
+            gcode_path = self.bgcode_to_gcode()
+            print("\n→ Converting gcode to gx...")
+            return self.gcode_to_gx(gcode_path)
+
         elif self.file_ext == '.gcode':
             print("\n→ Converting gcode to gx...")
             return self.gcode_to_gx(self.input_path)
-        
+
         elif self.file_ext == '.gx':
             print("\n✓ Already in GX format - no conversion needed")
             return self.input_path
@@ -280,7 +503,7 @@ class VoxelConverter:
 def main():
     if len(sys.argv) != 2:
         print("Usage: python voxel_converter.py <input_file>")
-        print("Supported formats: .stl, .gcode, .gx, .g")
+        print("Supported formats: .stl, .gcode, .bgcode, .gx, .g")
         sys.exit(1)
     
     try:
